@@ -1,6 +1,7 @@
 """SQLite 持久层。"""
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from typing import Any, Iterable
@@ -14,6 +15,14 @@ class TrustRootConflict(Exception):
 
 class TrustRootNotFound(Exception):
     """指定的信任根版本不存在。"""
+
+
+class ForkResolutionNoFork(Exception):
+    """目标制品当前不存在分叉 (少于两条不同证明), 无法裁决。"""
+
+
+class ForkResolutionInvalidSelection(Exception):
+    """所选 proof_id 不存在或不属于目标制品。"""
 
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -68,6 +77,21 @@ CREATE TABLE IF NOT EXISTS trust_root_state (
     version_id INTEGER NOT NULL REFERENCES trust_root_versions(id),
     activated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- 分叉裁决: 只追加 (append-only), 不更新不删除。每条裁决在同一事务中
+-- 原子固化裁决时该制品可见的全部分支 proof_id (branch_proof_ids, JSON 数组),
+-- 后续任何晚到分支都会使该集合与实时/当时可见集合不一致, 裁决即失效。
+CREATE TABLE IF NOT EXISTS fork_resolutions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    artifact_digest  TEXT NOT NULL,
+    selected_proof_id INTEGER NOT NULL REFERENCES proofs(id),
+    reason           TEXT NOT NULL,
+    branch_proof_ids TEXT NOT NULL,
+    resolved_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS ix_fork_resolutions_artifact
+    ON fork_resolutions (artifact_digest, id);
 """
 
 
@@ -315,3 +339,98 @@ def fetch_named_root_keys(
         (row["id"],),
     ).fetchall()
     return frozenset(r["public_key"] for r in rows)
+
+
+# ---------- 分叉裁决 ----------
+
+
+def _resolution_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "artifact_digest": row["artifact_digest"],
+        "selected_proof_id": row["selected_proof_id"],
+        "reason": row["reason"],
+        "branch_proof_ids": json.loads(row["branch_proof_ids"]),
+        "resolved_at": row["resolved_at"],
+    }
+
+
+def create_fork_resolution(
+    conn: sqlite3.Connection,
+    artifact_digest: str,
+    selected_proof_id: int,
+    reason: str,
+) -> dict[str, Any]:
+    """追加一条分叉裁决, 与当时全部分支 proof_id 在同一事务原子固化。
+
+    仅当目标当前确有至少两条不同证明 (ForkResolutionNoFork) 且所选记录
+    属于目标 (ForkResolutionInvalidSelection) 时写入成功。裁决记录只追加,
+    从不更新或删除; 相同的重复裁决也会产生新记录与新的 resolved_at。
+
+    使用 BEGIN IMMEDIATE 在事务起点即取得写锁: 并发的证明写入要么先于本
+    事务提交 (因此其分支会被纳入快照), 要么被阻塞到提交之后 (即严格意义上
+    的“晚到分支”, 固化集合随即与其不一致、校验时裁决失效), 不会读到
+    与固化动作撕裂的中间状态。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    finished = False
+    try:
+        rows = conn.execute(
+            "SELECT id FROM proofs WHERE artifact_digest = ? ORDER BY id",
+            (artifact_digest,),
+        ).fetchall()
+        # 唯一索引保证记录内容互不相同, 行数即不同证明条数。
+        if len(rows) < 2:
+            raise ForkResolutionNoFork(
+                f"制品 {artifact_digest} 当前不存在分叉, 无需裁决"
+            )
+        proof_ids = [r["id"] for r in rows]
+        if selected_proof_id not in proof_ids:
+            raise ForkResolutionInvalidSelection(
+                f"proof_id {selected_proof_id} 不属于制品 {artifact_digest} 的证明记录"
+            )
+
+        cur = conn.execute(
+            "INSERT INTO fork_resolutions"
+            " (artifact_digest, selected_proof_id, reason, branch_proof_ids)"
+            " VALUES (?, ?, ?, ?)",
+            (
+                artifact_digest,
+                selected_proof_id,
+                reason,
+                json.dumps(proof_ids, separators=(",", ":")),
+            ),
+        )
+        resolution_id = cur.lastrowid
+        conn.execute("COMMIT")
+        finished = True
+    finally:
+        # 业务拒绝 (已 raise) 或意外错误: 回滚不留半成品事务。
+        if not finished:
+            conn.execute("ROLLBACK")
+
+    row = conn.execute(
+        "SELECT * FROM fork_resolutions WHERE id = ?",
+        (resolution_id,),
+    ).fetchone()
+    return _resolution_to_dict(row)
+
+
+def fetch_fork_resolutions(
+    conn: sqlite3.Connection,
+    artifact_digest: str,
+    at: str | None = None,
+) -> list[dict[str, Any]]:
+    """按时间顺序 (旧 -> 新) 列出某制品的裁决; 传入 at 时只含 resolved_at <= at。"""
+    if at is None:
+        rows = conn.execute(
+            "SELECT * FROM fork_resolutions WHERE artifact_digest = ? ORDER BY id",
+            (artifact_digest,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM fork_resolutions"
+            " WHERE artifact_digest = ? AND resolved_at <= ? ORDER BY id",
+            (artifact_digest, at),
+        ).fetchall()
+    return [_resolution_to_dict(r) for r in rows]

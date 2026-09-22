@@ -13,11 +13,15 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from . import crypto
 from .config import settings
 from .database import (
+    ForkResolutionInvalidSelection,
+    ForkResolutionNoFork,
     TrustRootConflict,
     TrustRootNotFound,
     activate_trust_root,
+    create_fork_resolution,
     create_trust_root,
     fetch_active_root,
+    fetch_fork_resolutions,
     fetch_named_root_keys,
     fetch_proofs,
     fetch_revocation,
@@ -27,6 +31,7 @@ from .database import (
     row_to_dict,
 )
 from .schemas import (
+    ForkResolutionIn,
     GenericMessage,
     ProofIn,
     RevokeIn,
@@ -286,6 +291,59 @@ def get_revocation(
     if not row:
         raise HTTPException(status_code=404, detail="该制品未被撤销")
     return GenericMessage(status="REVOKED", detail=row["reason"], proof=row)
+
+
+# ---------- 分叉裁决 ----------
+
+
+@app.post(
+    "/fork-resolutions",
+    tags=["fork-resolutions"],
+    summary="对存在分叉的制品追加一条裁决 (选定唯一证明分支)",
+    status_code=201,
+)
+def create_fork_resolution_endpoint(
+    payload: ForkResolutionIn,
+    response: Response,
+    conn: sqlite3.Connection = Depends(db),
+) -> dict[str, Any]:
+    # 仅当目标当前确有至少两条不同证明 (否则 409), 且所选记录属于目标
+    # (否则 400) 时, 以追加记录方式保存裁决; 当时全部分支 proof_id 与
+    # 裁决在同一事务原子固化, 后续晚到分支会让该裁决在校验时失效。
+    try:
+        resolution = create_fork_resolution(
+            conn,
+            payload.artifact_digest,
+            payload.selected_proof_id,
+            payload.reason,
+        )
+    except ForkResolutionNoFork as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ForkResolutionInvalidSelection as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    response.status_code = 201
+    return {"status": "RESOLVED", **resolution}
+
+
+@app.get(
+    "/fork-resolutions/{artifact_digest}",
+    tags=["fork-resolutions"],
+    summary="按时间顺序 (旧 -> 新) 列出某制品的全部分叉裁决",
+)
+def list_fork_resolutions(
+    artifact_digest: str,
+    conn: sqlite3.Connection = Depends(db),
+) -> dict[str, Any]:
+    rows = fetch_fork_resolutions(conn, artifact_digest)
+    if not rows:
+        raise HTTPException(
+            status_code=404, detail="未找到该制品的分叉裁决记录"
+        )
+    return {
+        "status": "OK",
+        "artifact_digest": artifact_digest,
+        "resolutions": rows,
+    }
 
 
 # ---------- 信任根版本 ----------

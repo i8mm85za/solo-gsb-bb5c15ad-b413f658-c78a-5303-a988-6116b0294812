@@ -6,8 +6,9 @@
 - 写入时校验公钥格式；**校验时验证 Ed25519 签名**，并从被校验制品出发**沿父链递归直到信任根**
 - 同一制品出现**分叉**（多条不同证明）或链上存在**被撤销祖先**时，返回带有序节点的 **可定位失败路径**
 - 校验成功时返回**有序信任链**（target → … → root）
-- 支持 `?at=<RFC3339 UTC>` **历史时点校验**：只基于该时点已可见的证明与已生效的撤销求值，晚到分叉/后续撤销不改变更早时点的结论
-- 提供记录写入、制品校验、撤销、记录查询接口
+- 支持 **分叉裁决**：`POST /fork-resolutions` 以**只追加**方式记录人工/外部裁决并原子固化裁决时的全部分支；校验只采用**分支集合与当时可见集合完全一致的最新裁决**，裁决前返回 `FORK`，裁决后可继续验链，任何**晚到分支**都会使旧裁决失效而重新返回 `FORK`
+- 支持 `?at=<RFC3339 UTC>` **历史时点校验**：只基于该时点已可见的证明、已生效的撤销与已产生的裁决求值，晚到分叉/晚到裁决/后续撤销不改变更早时点的结论
+- 提供记录写入、制品校验、撤销、分叉裁决、记录查询接口
 - **信任根版本管理**：`POST /trust-roots` 创建带唯一名称、Ed25519 公钥集合与说明的**不可变版本**；`PUT /trust-roots/{name}/activate` **原子切换**当前版本；`GET /trust-roots` 查看全部版本及激活状态；校验可用 `?root_version=<name>` **固定到指定版本**
 - Dockerfile + Docker Compose 一键启动，SQLite 数据持久化到命名卷
 
@@ -43,7 +44,7 @@ python3 -m pip install -r requirements.txt
 DATABASE_PATH=data/proofs.db python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8080
 ```
 
-### 一键演示（成功链 / 撤销祖先 / 祖先分叉）
+### 一键演示（成功链 / 撤销祖先 / 祖先分叉 / 分叉裁决）
 
 ```bash
 # 服务启动后, 另开终端:
@@ -89,7 +90,9 @@ print(encode_public_key(priv.public_key()))   # 作为 public_keys 之一 POST �
 | --- | --- | --- |
 | `POST` | `/proofs` | 写入一条证明记录（内容完全相同的重复提交幂等去重，返回 `200`） |
 | `GET` | `/proofs/artifact/{artifact_digest}` | 列出某制品的全部证明记录 |
-| `GET` | `/verify/{artifact_digest}` | 递归校验完整证明链；可选 `?at=` 历史时点、`?root_version=<name>` 固定信任根版本 |
+| `GET` | `/verify/{artifact_digest}` | 递归校验完整证明链；可选 `?at=` 历史时点、`?root_version=<name>` 固定信任根版本；存在适用分叉裁决时附带 `applied_resolution` |
+| `POST` | `/fork-resolutions` | 对存在分叉的制品**追加**一条裁决（选定唯一证明分支，原子固化当时全部分支 `proof_id`） |
+| `GET` | `/fork-resolutions/{artifact_digest}` | 按时间顺序（旧 → 新）列出某制品的全部裁决 |
 | `POST` | `/revocations` | 撤销一个制品（幂等，已撤销返回 `200`） |
 | `GET` | `/revocations` | 列出全部撤销记录 |
 | `GET` | `/revocations/{artifact_digest}` | 查询单个制品撤销状态 |
@@ -132,7 +135,7 @@ print(encode_public_key(priv.public_key()))   # 作为 public_keys 之一 POST �
 
 **失败**（除 `NOT_FOUND` 为 HTTP 404 外，其余为 HTTP 200 且 `status != OK`）：
 
-- `FORK`：目标或祖先存在多条不同证明。`failure.at` 定位分叉点，`failure.branches` 列出全部候选分支（含各自的签名/撤销状态）；`failure_path` 给出从目标到分叉点的有序路径。
+- `FORK`：目标或祖先存在多条不同证明，且**没有适用的分叉裁决**。`failure.at` 定位分叉点，`failure.branches` 列出全部候选分支（含各自的签名/撤销状态）；`failure_path` 给出从目标到分叉点的有序路径。存在与当时分支集合完全一致的最新裁决时不再返回 `FORK`，而是沿选定分支继续（见 [3.3](#33-分叉裁决-post-fork-resolutions)，响应附 `applied_resolution`）。
 - `REVOKED`：目标或祖先被撤销。路径末节点 `relation` 为 `revoked`（目标自身）或 `revoked_ancestor`（祖先），并携带 `revocation` 详情（原因、时间）。
 - `INVALID_SIGNATURE`：Ed25519 签名验证失败。
 - `MISSING_PARENT`：父制品没有任何证明记录，`failure.missing_artifact` 指明缺失节点。
@@ -164,7 +167,7 @@ print(encode_public_key(priv.public_key()))   # 作为 public_keys 之一 POST �
 curl "http://localhost:8080/verify/sha256:image?at=2026-09-22T08:00:00Z"
 ```
 
-- **数据可见性**：只读取 `created_at <= at` 的证明记录，且仅 `revoked_at <= at` 的撤销视为生效（边界均为闭区间）。因此**晚到的分叉/父证明、以及时点之后的撤销，都不会改变更早时点的结论**。
+- **数据可见性**：只读取 `created_at <= at` 的证明记录，且仅 `revoked_at <= at` 的撤销、`resolved_at <= at` 的分叉裁决视为生效（边界均为闭区间）。因此**晚到的分叉/父证明、时点之后的撤销与裁决，都不会改变更早时点的结论**。裁决只在其固化分支集合与该时点可见证明集合完全一致时才被采用。
 - **`evaluated_at`**：传入 `at` 时响应附带该字段，为归一化后的 UTC 毫秒串（如 `2026-09-22T08:00:00.000Z`）；带偏移的输入（如 `+08:00`，需 URL 编码为 `%2B`）会归一化为 UTC。未传 `at` 时响应结构与之前完全一致，不含该字段。
 - **错误语义**：`at` 非法（非 RFC3339、缺时区偏移等）或**晚于当前时间**返回 `400`；该时点尚无目标制品的任何证明记录仍返回 `404`；其余状态码与失败路径语义与实时校验相同。
 
@@ -183,7 +186,64 @@ curl "http://localhost:8080/verify/sha256:image?at=2026-09-22T08:00:00Z&root_ver
 - 当根来自某个版本（激活或固定）时，成功响应附带 `root_version` 字段；回退到环境变量/开发模式时不带该字段。
 - 公钥集合在单次快照读取中取齐并在整次校验中固定，与并发 `activate` 互不撕裂。
 
-### 3.3 信任根版本管理
+### 3.3 分叉裁决 `POST /fork-resolutions`
+
+当一个制品存在多条互不相同的证明时，校验默认返回 `FORK`（系统不自动选择分支）。分叉裁决用于在**不删除任何证明**的前提下，以**只追加（append-only）**的记录方式声明“本次采用哪条分支”。
+
+```json
+{
+  "artifact_digest": "sha256:child",
+  "selected_proof_id": 2,
+  "reason": "经发布者确认, id=2 为官方构建证明"
+}
+```
+
+写入规则：
+
+- 仅当目标制品**当前确有至少两条不同证明**时才接受；没有分叉（含制品不存在）返回 **`409`**。
+- `selected_proof_id` 必须是该制品名下真实存在的证明记录 id；不属于目标（或不存在）返回 **`400`**。
+- 成功返回 **`201`**；裁决**只追加**，不更新、不删除——对同一分叉的重复或改判裁决都会产生新记录与新的 `resolved_at`。
+- 写入在**单个事务**中完成，并**原子固化裁决当时该制品可见的全部分支 `proof_id`**（按 id 排序的 JSON 数组）：
+
+```json
+{
+  "status": "RESOLVED",
+  "id": 1,
+  "artifact_digest": "sha256:child",
+  "selected_proof_id": 2,
+  "reason": "经发布者确认, id=2 为官方构建证明",
+  "branch_proof_ids": [2, 3],
+  "resolved_at": "2026-09-22T08:00:00.000Z"
+}
+```
+
+证明记录 id 可通过 `GET /proofs/artifact/{artifact_digest}` 查询。
+
+**裁决如何在校验时生效**（实时与 `?at=` 历史校验语义一致）：
+
+1. 遇到分叉（无论在目标还是祖先）时，查找该时点**之前最新**、且其固化的分支 `proof_id` 集合与**当时可见证明集合完全一致**的裁决。
+2. **裁决前**（无任何匹配裁决）：仍返回 `FORK`。
+3. **裁决后**：沿裁决选定的证明继续递归验链（选定分支自身的签名、父链、信任根仍照常校验），响应附带 **`applied_resolution`**；链上被消解的分叉点条目标记 `relation: "fork_point"` 并内联 `resolution`。
+4. **任何晚到分支**都会扩大可见集合，使旧裁决固化的集合不再相等而**立即失效**，校验重新返回 `FORK`；针对新集合再次追加裁决后恢复可验。
+5. 历史校验中，仅 `resolved_at <= at` 的裁决参与选择，且与之比较的是该时点 `created_at <= at` 的可见证明集合——因此晚到的裁决或晚到的分支都不会改变更早时点的结论。
+
+`applied_resolution` 为沿 target → root 路径上**离目标最近**的被应用裁决（形状与 `GET` 返回的裁决记录一致）；即使裁决已应用、但选定分支随后因签名非法/祖先撤销等失败，响应也会携带该字段，说明“采用了哪条裁决、之后为何仍失败”。未应用任何裁决的响应（含 `FORK`）不带该字段。
+
+**列出裁决** `GET /fork-resolutions/{artifact_digest}`：按时间顺序（旧 → 新）返回某制品的全部裁决（`resolutions` 数组）；该制品没有任何裁决返回 `404`。
+
+```bash
+# 1) 制造分叉并查出候选 proof_id
+curl http://localhost:8080/proofs/artifact/sha256:child
+# 2) 追加裁决
+curl -X POST http://localhost:8080/fork-resolutions -H 'Content-Type: application/json' \
+  -d '{"artifact_digest":"sha256:child","selected_proof_id":2,"reason":"官方构建"}'
+# 3) 裁决后验链成功, 响应含 applied_resolution
+curl http://localhost:8080/verify/sha256:child
+# 4) 查看全部裁决
+curl http://localhost:8080/fork-resolutions/sha256:child
+```
+
+### 3.4 信任根版本管理
 
 **创建版本** `POST /trust-roots`（不可变，创建后**不自动激活**）：
 
@@ -237,7 +297,7 @@ curl -X PUT http://localhost:8080/trust-roots/v-2026-09/activate
 curl http://localhost:8080/trust-roots
 ```
 
-### 3.4 撤销制品 `POST /revocations`
+### 3.5 撤销制品 `POST /revocations`
 
 ```json
 { "artifact_digest": "sha256:os", "reason": "CVE-2026-xxxx / 密钥泄露" }
@@ -245,7 +305,7 @@ curl http://localhost:8080/trust-roots
 
 撤销后，该制品及其**全部下游**校验都会失败（附完整失败路径）。撤销本身幂等、不可通过该接口删除。
 
-### 3.5 生成签名（客户端示例）
+### 3.6 生成签名（客户端示例）
 
 ```python
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -260,18 +320,18 @@ signature = sign(priv, "sha256:abc123", "sha256:def456")  # parent 为 None 表�
 
 1. 制品无任何记录 → `NOT_FOUND`（404）。
 2. 目标制品已撤销 → `REVOKED`。
-3. 同一 `artifact_digest` 存在多条不同证明（issuer/parent/signature 任一不同）→ `FORK`。
-4. 用记录内 `issuer` 公钥对 canonical message 验签，失败 → `INVALID_SIGNATURE`。
-5. 沿 `parent_digest` 向上重复 2–4；父节点缺失 / 分叉 / 撤销 / 签名非法 / 成环均带有序失败路径返回。
+3. 同一 `artifact_digest` 存在多条不同证明（issuer/parent/signature 任一不同）→ 分叉：存在**适用裁决**（该时点之前最新、固化分支集合与当时可见集合**完全一致**）时沿其 `selected_proof_id` 选定的分支继续验链并在响应附 `applied_resolution`；否则 → `FORK`。任何晚到分支都会扩大可见集合，使旧裁决失效。
+4. 用记录内 `issuer` 公钥对 canonical message 验签，失败 → `INVALID_SIGNATURE`（裁决选定的分支同样必须通过验签）。
+5. 沿 `parent_digest` 向上重复 2–4；父节点缺失 / 无适用裁决的分叉 / 撤销 / 签名非法 / 成环均带有序失败路径返回。
 6. 到达根（`parent_digest` 为空）时，根 `issuer` 必须在本次生效的信任根公钥集合中（`?root_version=` 指定版本 → 该版本；否则当前激活版本；再否则 `TRUSTED_ROOT_ISSUERS`；都为空则开发模式接受任意自签名根），否则 `UNTRUSTED_ROOT`。
 
-传入 `?at=` 时，上述规则中的“存在记录”与“已撤销”均按该时点判定（`created_at <= at`、`revoked_at <= at`），规则本身与返回结构不变。
+传入 `?at=` 时，上述规则中的“存在记录”“已撤销”与“已产生裁决”均按该时点判定（`created_at <= at`、`revoked_at <= at`、`resolved_at <= at`），规则本身与返回结构不变（`applied_resolution` 同样仅在该时点存在适用裁决时附带）。
 
 ## 5. 环境变量
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `DATABASE_PATH` | `data/proofs.db`（容器内 `/data/proofs.db`） | SQLite 文件路径，容器内挂载命名卷；信任根版本同样持久化于此 |
+| `DATABASE_PATH` | `data/proofs.db`（容器内 `/data/proofs.db`） | SQLite 文件路径，容器内挂载命名卷；信任根版本与分叉裁决同样持久化于此 |
 | `TRUSTED_ROOT_ISSUERS` | 空（开发模式） | 回退用受信任根公钥，Base64，逗号分隔；仅当没有已激活的信任根版本时生效 |
 | `MAX_CHAIN_DEPTH` | `256` | 单次校验最大遍历深度 |
 
@@ -282,23 +342,24 @@ python3 -m pip install pytest httpx
 python3 -m pytest -q
 ```
 
-覆盖：合法链/根、签名往返、幂等写入与撤销、目标/祖先分叉、目标/祖先撤销定位、非法签名、缺失父节点、成环、非信任根，历史时点校验（非法/未来 `at` → 400、时点前 404、时间边界闭区间、`evaluated_at` 归一化、晚到分叉、晚到父证明、撤销前后），以及信任根版本管理（创建/重名 409/非法公钥 400、公钥去重、激活与原子切换、版本列表与 `effective_source`、`?root_version=` 固定/未知版本 400/空白等同未传、环境变量回退、激活与校验并发不撕裂公钥）等 46 个用例。
+覆盖：合法链/根、签名往返、幂等写入与撤销、目标/祖先分叉、目标/祖先撤销定位、非法签名、缺失父节点、成环、非信任根，历史时点校验（非法/未来 `at` → 400、时点前 404、时间边界闭区间、`evaluated_at` 归一化、晚到分叉、晚到父证明、撤销前后），信任根版本管理（创建/重名 409/非法公钥 400、公钥去重、激活与原子切换、版本列表与 `effective_source`、`?root_version=` 固定/未知版本 400/空白等同未传、环境变量回退、激活与校验并发不撕裂公钥），以及分叉裁决（无分叉 409、非法选择 400、裁决原子固化全分支、只追加、目标/祖先分叉裁决后继续验链与 `applied_resolution`、晚到分支使裁决失效并重新 `FORK`、最新匹配裁决优先、选定分支仍验签、裁决后撤销失败路径、`GET` 列表有序/404、`?at=` 下裁决时点边界与晚到分支的历史一致性、单证明时点不误用裁决）共 63 个用例。
 
 ## 7. 目录结构
 
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由 (含信任根版本管理与 ?root_version)
-│   ├── verifier.py    # 递归校验 / 分叉 / 撤销 / 失败路径 / 历史时点求值
+│   ├── main.py        # FastAPI 路由 (分叉裁决、信任根版本管理与 ?root_version)
+│   ├── verifier.py    # 递归校验 / 分叉与裁决 / 撤销 / 失败路径 / 历史时点求值
 │   ├── crypto.py      # Ed25519 与规范化签名载荷
-│   ├── database.py    # SQLite 表结构与查询 (含时点过滤、信任根版本)
+│   ├── database.py    # SQLite 表结构与查询 (含时点过滤、信任根版本、只追加裁决)
 │   ├── timeutil.py    # RFC3339 解析与 UTC 毫秒格式化
 │   ├── config.py      # 环境变量配置
 │   └── schemas.py     # Pydantic 模型
 ├── demo/demo.py       # 端到端演示
 ├── tests/             # pytest 测试
 │   ├── test_verifier.py
+│   ├── test_fork_resolutions.py
 │   └── test_trust_roots.py
 ├── Dockerfile
 ├── docker-compose.yml

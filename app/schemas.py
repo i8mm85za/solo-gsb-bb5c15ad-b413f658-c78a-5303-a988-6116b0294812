@@ -65,6 +65,24 @@ class GenericMessage(BaseModel):
     revocations: list[dict[str, Any]] | None = None
 
 
+# ---------- 分叉裁决 ----------
+
+
+class ForkResolutionIn(BaseModel):
+    artifact_digest: str = Field(
+        ..., min_length=1, description="发生分叉的制品摘要"
+    )
+    selected_proof_id: int = Field(
+        ..., gt=0, description="裁决选定的证明记录 id (必须属于该制品)"
+    )
+    reason: str = Field(..., min_length=1, max_length=1024, description="裁决理由")
+
+    @field_validator("artifact_digest", "reason")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        return v.strip()
+
+
 # ---------- 信任根版本 ----------
 
 

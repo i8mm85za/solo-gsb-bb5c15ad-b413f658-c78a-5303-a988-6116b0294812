@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""端到端演示: 生成密钥 -> 写入根/子证明 -> 校验 -> 制造分叉/撤销 -> 观察失败路径。
+"""端到端演示: 生成密钥 -> 写入根/子证明 -> 校验 -> 制造分叉/撤销 -> 观察失败路径
+-> 分叉裁决 -> 裁决后恢复验链。
 
 仅依赖标准库 + cryptography (容器内已安装)。
 用法:
@@ -102,6 +103,36 @@ def main() -> None:
 
     status, body = _request("GET", f"/verify/{l2}")
     show("失败: 祖先分叉 FORK, branches 列出全部候选", status, body)
+
+    # 4) 分叉裁决: 追加裁决选定 root_priv 对 m2 的证明, 验链恢复;
+    #    随后一条晚到的第三分支使旧裁决失效, 重新返回 FORK。
+    r3 = f"sha256:baseos3-{tag}"
+    m3 = f"sha256:app3-{tag}"
+    l3 = f"sha256:image3-{tag}"
+    post_proof(root_priv, root_pub, r3)
+    chosen = post_proof(root_priv, root_pub, m3, parent=r3)
+    post_proof(other_priv, other_pub, m3, parent=r3)
+    post_proof(root_priv, root_pub, l3, parent=m3)
+
+    status, body = _request("GET", f"/verify/{l3}")
+    show("裁决前: 祖先分叉 FORK", status, body)
+
+    status, resolution = _request(
+        "POST",
+        "/fork-resolutions",
+        {
+            "artifact_digest": m3,
+            "selected_proof_id": chosen["proof_id"],
+            "reason": "演示: 采用官方签发者 root_priv 的构建证明",
+        },
+    )
+    show("追加分叉裁决 (原子固化当时全部分支 proof_id)", status, resolution)
+
+    status, body = _request("GET", f"/verify/{l3}")
+    show("裁决后: 沿选定分支继续验链 OK, 附带 applied_resolution", status, body)
+
+    status, body = _request("GET", f"/fork-resolutions/{m3}")
+    show("按时间列出该制品的全部裁决", status, body)
 
     print("\n演示完成。")
 
