@@ -125,3 +125,44 @@ class TrustRootListResponse(BaseModel):
     active_version: str | None = None
     effective_source: str
     trust_roots: list[TrustRootResponse]
+
+
+# ---------- 分叉裁决 ----------
+
+
+class ForkResolutionIn(BaseModel):
+    artifact_digest: str = Field(
+        ..., min_length=1, description="发生分叉的制品摘要"
+    )
+    selected_proof_id: int = Field(
+        ...,
+        description=(
+            "裁决选定的证明记录 id (必须属于该制品); "
+            "非法/不存在/不属于目标均返回 400"
+        ),
+    )
+    reason: str = Field(
+        ..., min_length=1, max_length=2048, description="裁决理由"
+    )
+
+    @field_validator("artifact_digest", "reason")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        return v.strip()
+
+
+class ForkResolutionResponse(BaseModel):
+    id: int
+    artifact_digest: str
+    selected_proof_id: int
+    reason: str
+    branch_proof_ids: list[int] = Field(
+        ..., description="裁决当时全部分支 proof_id 的原子快照"
+    )
+    created_at: str
+
+
+class ForkResolutionListResponse(BaseModel):
+    status: str
+    artifact_digest: str
+    resolutions: list[ForkResolutionResponse]

@@ -6,7 +6,8 @@
 - 写入时校验公钥格式；**校验时验证 Ed25519 签名**，并从被校验制品出发**沿父链递归直到信任根**
 - 同一制品出现**分叉**（多条不同证明）或链上存在**被撤销祖先**时，返回带有序节点的 **可定位失败路径**
 - 校验成功时返回**有序信任链**（target → … → root）
-- 支持 `?at=<RFC3339 UTC>` **历史时点校验**：只基于该时点已可见的证明与已生效的撤销求值，晚到分叉/后续撤销不改变更早时点的结论
+- 支持**分叉裁决**：`POST /fork-resolutions` 追加裁决并原子记录当时全部分支；裁决后校验沿所选分支继续验链，任何**晚到分支**都会使旧裁决失效并重新返回 `FORK`（实时与 `?at=` 历史校验语义一致）
+- 支持 `?at=<RFC3339 UTC>` **历史时点校验**：只基于该时点已可见的证明、已生效的撤销与当时适用的裁决求值，晚到分叉/后续撤销不改变更早时点的结论
 - 提供记录写入、制品校验、撤销、记录查询接口
 - **信任根版本管理**：`POST /trust-roots` 创建带唯一名称、Ed25519 公钥集合与说明的**不可变版本**；`PUT /trust-roots/{name}/activate` **原子切换**当前版本；`GET /trust-roots` 查看全部版本及激活状态；校验可用 `?root_version=<name>` **固定到指定版本**
 - Dockerfile + Docker Compose 一键启动，SQLite 数据持久化到命名卷
@@ -93,6 +94,8 @@ print(encode_public_key(priv.public_key()))   # 作为 public_keys 之一 POST �
 | `POST` | `/revocations` | 撤销一个制品（幂等，已撤销返回 `200`） |
 | `GET` | `/revocations` | 列出全部撤销记录 |
 | `GET` | `/revocations/{artifact_digest}` | 查询单个制品撤销状态 |
+| `POST` | `/fork-resolutions` | 对分叉制品追加一条裁决（选定 proof_id，原子记录当时全部分支） |
+| `GET` | `/fork-resolutions/{artifact_digest}` | 按时间列出某制品的全部分叉裁决（含已失效裁决） |
 | `POST` | `/trust-roots` | 创建不可变的信任根版本（唯一名称 + 公钥集合 + 说明） |
 | `PUT` | `/trust-roots/{name}/activate` | 原子切换当前激活的信任根版本 |
 | `GET` | `/trust-roots` | 列出全部信任根版本及激活状态 |
@@ -122,6 +125,7 @@ print(encode_public_key(priv.public_key()))   # 作为 public_keys 之一 POST �
   "status": "OK",
   "length": 3,
   "root_issuer": "<根公钥>",
+  "applied_resolution": null,
   "chain": [
     { "artifact_digest": "sha256:image", "issuer": "...", "parent_digest": "sha256:app", "relation": "target", "revocation": null },
     { "artifact_digest": "sha256:app",   "issuer": "...", "parent_digest": "sha256:os",  "relation": "ancestor", "revocation": null },
@@ -130,9 +134,14 @@ print(encode_public_key(priv.public_key()))   # 作为 public_keys 之一 POST �
 }
 ```
 
+所有校验响应（含 `FORK` 等失败响应）都附带 **`applied_resolution`** 字段：
+
+- 目标制品自身分叉且套用了裁决时，为该裁决对象（结构见 3.3 节）；链中被裁决的分叉节点（含祖先分叉点）也各自带 `resolution` 字段。
+- 其余情况（无分叉、分叉未裁决、裁决已被晚到分支作废、仅祖先分叉被裁决）为 `null`。
+
 **失败**（除 `NOT_FOUND` 为 HTTP 404 外，其余为 HTTP 200 且 `status != OK`）：
 
-- `FORK`：目标或祖先存在多条不同证明。`failure.at` 定位分叉点，`failure.branches` 列出全部候选分支（含各自的签名/撤销状态）；`failure_path` 给出从目标到分叉点的有序路径。
+- `FORK`：目标或祖先存在多条不同证明。`failure.at` 定位分叉点，`failure.branches` 列出全部候选分支（含 `proof_id` 及各自的签名/撤销状态）；`failure_path` 给出从目标到分叉点的有序路径。**存在适用裁决时不返回 `FORK`**，改为沿裁决所选分支继续验链（见 3.3 节）。
 - `REVOKED`：目标或祖先被撤销。路径末节点 `relation` 为 `revoked`（目标自身）或 `revoked_ancestor`（祖先），并携带 `revocation` 详情（原因、时间）。
 - `INVALID_SIGNATURE`：Ed25519 签名验证失败。
 - `MISSING_PARENT`：父制品没有任何证明记录，`failure.missing_artifact` 指明缺失节点。
@@ -183,7 +192,63 @@ curl "http://localhost:8080/verify/sha256:image?at=2026-09-22T08:00:00Z&root_ver
 - 当根来自某个版本（激活或固定）时，成功响应附带 `root_version` 字段；回退到环境变量/开发模式时不带该字段。
 - 公钥集合在单次快照读取中取齐并在整次校验中固定，与并发 `activate` 互不撕裂。
 
-### 3.3 信任根版本管理
+### 3.3 分叉裁决
+
+出现分叉后，可通过追加一条**裁决（fork resolution）**声明采用哪一条证明。裁决是**只追加（append-only）**记录，不修改、不删除。
+
+**创建裁决** `POST /fork-resolutions`：
+
+```json
+{
+  "artifact_digest": "sha256:app",
+  "selected_proof_id": 12,
+  "reason": "应急审查后确认签发者 B 的证明为权威版本"
+}
+```
+
+- 仅当目标制品当前确有**至少两条不同证明**时才接受：无分叉（含制品不存在）返回 **`409`**。
+- `selected_proof_id` 必须属于该目标制品的证明记录；非法、不存在或属于其他制品返回 **`400`**。
+- 成功返回 `201`，响应中 **`branch_proof_ids` 是裁决当时全部分支 `proof_id` 的原子快照**（校验与写入在同一 `BEGIN IMMEDIATE` 事务内完成，并发写入不会漏看分支）：
+
+```json
+{
+  "id": 3,
+  "artifact_digest": "sha256:app",
+  "selected_proof_id": 12,
+  "reason": "应急审查后确认签发者 B 的证明为权威版本",
+  "branch_proof_ids": [12, 17],
+  "created_at": "2026-09-22T10:00:00.000Z"
+}
+```
+
+**裁决如何影响校验**（实时与 `?at=` 历史校验一致）：
+
+1. 分叉点先选取**该时点之前最新**的一条裁决，且其 `branch_proof_ids` 必须与当时可见分支集合**完全一致**（集合相等，含顺序无关）。
+2. 命中则校验沿 `selected_proof_id` 对应证明继续：签名、撤销、父链、信任根规则照常生效（选错到非法签名分支仍返回 `INVALID_SIGNATURE`）。响应顶层 `applied_resolution` 携带该裁决；被裁决的分叉链节点附带 `resolution` 字段（目标节点 `relation` 仍为 `target`，祖先节点仍为 `ancestor`/`root` 等标准关系）。
+3. 未命中（从未裁决、裁决晚于 `at`、或集合不一致）时仍返回 `FORK` 且 `applied_resolution` 为 `null`。
+4. **任何晚到分支都会使旧裁决失效**：出现一条新的不同证明后可见集合变为三分支，旧裁决的两分支快照不再与之一致 → 立即重新返回 `FORK`；对新的完整分支集合再次裁决后恢复验链。已失效的旧裁决仍保留在列表中。
+
+```bash
+# 1) 分叉 -> FORK
+curl -s http://localhost:8080/verify/sha256:app | jq .status          # "FORK"
+
+# 2) 查看候选分支的 proof_id
+curl -s http://localhost:8080/proofs/artifact/sha256:app | jq '.proofs[].id'
+
+# 3) 追加裁决
+curl -s -X POST http://localhost:8080/fork-resolutions \
+  -H 'Content-Type: application/json' \
+  -d '{"artifact_digest":"sha256:app","selected_proof_id":12,"reason":"investigated"}'
+
+# 4) 再次校验 -> 沿所选分支继续
+curl -s http://localhost:8080/verify/sha256:app | jq '{status, applied_resolution}'
+```
+
+**历史时点**：传入 `?at=` 时，只有 `created_at <= at` 的裁决可见；在裁决作出之前的时点校验仍返回 `FORK`，裁决生效时点（闭区间）起沿所选分支求值。更晚到达的新分支不会改变裁决时点上的结论（当时可见集合仍是两分支），但在新分支可见的时点上旧裁决失效。
+
+**列出裁决** `GET /fork-resolutions/{artifact_digest}`：按时间（写入顺序）返回该制品的**全部**裁决，包括已被晚到分支作废的旧裁决；该制品无任何裁决返回 `404`。
+
+### 3.4 信任根版本管理
 
 **创建版本** `POST /trust-roots`（不可变，创建后**不自动激活**）：
 
@@ -237,7 +302,7 @@ curl -X PUT http://localhost:8080/trust-roots/v-2026-09/activate
 curl http://localhost:8080/trust-roots
 ```
 
-### 3.4 撤销制品 `POST /revocations`
+### 3.5 撤销制品 `POST /revocations`
 
 ```json
 { "artifact_digest": "sha256:os", "reason": "CVE-2026-xxxx / 密钥泄露" }
@@ -245,7 +310,7 @@ curl http://localhost:8080/trust-roots
 
 撤销后，该制品及其**全部下游**校验都会失败（附完整失败路径）。撤销本身幂等、不可通过该接口删除。
 
-### 3.5 生成签名（客户端示例）
+### 3.6 生成签名（客户端示例）
 
 ```python
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -260,18 +325,18 @@ signature = sign(priv, "sha256:abc123", "sha256:def456")  # parent 为 None 表�
 
 1. 制品无任何记录 → `NOT_FOUND`（404）。
 2. 目标制品已撤销 → `REVOKED`。
-3. 同一 `artifact_digest` 存在多条不同证明（issuer/parent/signature 任一不同）→ `FORK`。
+3. 同一 `artifact_digest` 存在多条不同证明（issuer/parent/signature 任一不同）→ 分叉：若存在适用裁决（该时点之前最新且 `branch_proof_ids` 与可见分支集合完全一致），沿所选证明继续执行 4–6；否则返回 `FORK`。晚到分支使旧裁决集合不一致而失效。
 4. 用记录内 `issuer` 公钥对 canonical message 验签，失败 → `INVALID_SIGNATURE`。
-5. 沿 `parent_digest` 向上重复 2–4；父节点缺失 / 分叉 / 撤销 / 签名非法 / 成环均带有序失败路径返回。
+5. 沿 `parent_digest` 向上重复 2–4；父节点缺失 / 分叉（按规则 3 处理裁决）/ 撤销 / 签名非法 / 成环均带有序失败路径返回。
 6. 到达根（`parent_digest` 为空）时，根 `issuer` 必须在本次生效的信任根公钥集合中（`?root_version=` 指定版本 → 该版本；否则当前激活版本；再否则 `TRUSTED_ROOT_ISSUERS`；都为空则开发模式接受任意自签名根），否则 `UNTRUSTED_ROOT`。
 
-传入 `?at=` 时，上述规则中的“存在记录”与“已撤销”均按该时点判定（`created_at <= at`、`revoked_at <= at`），规则本身与返回结构不变。
+传入 `?at=` 时，上述规则中的“存在记录”“已撤销”与“已作出的裁决”均按该时点判定（`created_at <= at`、`revoked_at <= at`），规则本身与返回结构不变。
 
 ## 5. 环境变量
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `DATABASE_PATH` | `data/proofs.db`（容器内 `/data/proofs.db`） | SQLite 文件路径，容器内挂载命名卷；信任根版本同样持久化于此 |
+| `DATABASE_PATH` | `data/proofs.db`（容器内 `/data/proofs.db`） | SQLite 文件路径，容器内挂载命名卷；信任根版本与分叉裁决同样持久化于此 |
 | `TRUSTED_ROOT_ISSUERS` | 空（开发模式） | 回退用受信任根公钥，Base64，逗号分隔；仅当没有已激活的信任根版本时生效 |
 | `MAX_CHAIN_DEPTH` | `256` | 单次校验最大遍历深度 |
 
@@ -282,24 +347,25 @@ python3 -m pip install pytest httpx
 python3 -m pytest -q
 ```
 
-覆盖：合法链/根、签名往返、幂等写入与撤销、目标/祖先分叉、目标/祖先撤销定位、非法签名、缺失父节点、成环、非信任根，历史时点校验（非法/未来 `at` → 400、时点前 404、时间边界闭区间、`evaluated_at` 归一化、晚到分叉、晚到父证明、撤销前后），以及信任根版本管理（创建/重名 409/非法公钥 400、公钥去重、激活与原子切换、版本列表与 `effective_source`、`?root_version=` 固定/未知版本 400/空白等同未传、环境变量回退、激活与校验并发不撕裂公钥）等 46 个用例。
+覆盖：合法链/根、签名往返、幂等写入与撤销、目标/祖先分叉、目标/祖先撤销定位、非法签名、缺失父节点、成环、非信任根，历史时点校验（非法/未来 `at` → 400、时点前 404、时间边界闭区间、`evaluated_at` 归一化、晚到分叉、晚到父证明、撤销前后），信任根版本管理（创建/重名 409/非法公钥 400、公钥去重、激活与原子切换、版本列表与 `effective_source`、`?root_version=` 固定/未知版本 400/空白等同未传、环境变量回退、激活与校验并发不撕裂公钥），以及分叉裁决（无分叉/未知制品 409、非法/越权 `selected_proof_id` 400、原子分支快照、只追加与时间序列表、裁决前 FORK/裁决后验链、目标与祖先分叉、晚到分支失效与重新裁决、历史时点下裁决前后/晚到分支不追溯/仅采用集合一致的最新裁决）共 65 个用例。
 
 ## 7. 目录结构
 
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由 (含信任根版本管理与 ?root_version)
-│   ├── verifier.py    # 递归校验 / 分叉 / 撤销 / 失败路径 / 历史时点求值
+│   ├── main.py        # FastAPI 路由 (含信任根版本管理、?root_version、分叉裁决)
+│   ├── verifier.py    # 递归校验 / 分叉 / 撤销 / 失败路径 / 历史时点求值 / 裁决套用
 │   ├── crypto.py      # Ed25519 与规范化签名载荷
-│   ├── database.py    # SQLite 表结构与查询 (含时点过滤、信任根版本)
+│   ├── database.py    # SQLite 表结构与查询 (含时点过滤、信任根版本、fork_resolutions)
 │   ├── timeutil.py    # RFC3339 解析与 UTC 毫秒格式化
 │   ├── config.py      # 环境变量配置
 │   └── schemas.py     # Pydantic 模型
 ├── demo/demo.py       # 端到端演示
 ├── tests/             # pytest 测试
 │   ├── test_verifier.py
-│   └── test_trust_roots.py
+│   ├── test_trust_roots.py
+│   └── test_fork_resolutions.py
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

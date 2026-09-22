@@ -17,6 +17,14 @@
 - 只读取 created_at <= at 的证明记录, 仅 revoked_at <= at 的撤销视为生效;
   因此晚到的分叉/父证明与后续撤销都不会改变更早时点的结论。
 - 响应中附带 evaluated_at (归一化后的 UTC 毫秒串), 不传 at 时不附带。
+
+分叉裁决 (fork resolution):
+- 分叉点先查该时点之前最新、且记录分支集合与当时可见分支集合完全一致
+  的裁决 (POST /fork-resolutions): 存在则沿所选证明继续验链,
+  该链节点 relation 为 resolved_fork_point (目标节点仍为 target),
+  并在节点与顶层 applied_resolution 中附带裁决信息。
+- 无匹配裁决 (未裁决 / 晚到分支使旧裁决集合失效) 时仍返回 FORK,
+  applied_resolution 为 null。
 """
 from __future__ import annotations
 
@@ -27,7 +35,11 @@ from typing import Any
 
 from . import crypto
 from .config import Settings, settings as default_settings
-from .database import fetch_proofs, fetch_revocation
+from .database import (
+    fetch_applicable_resolution,
+    fetch_proofs,
+    fetch_revocation,
+)
 from .timeutil import format_utc_ms
 
 # verdict 状态码
@@ -55,20 +67,53 @@ def _entry(
     record: dict[str, Any],
     relation: str,
     revocation: dict[str, Any] | None = None,
+    resolution: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    out = {
         "artifact_digest": record["artifact_digest"],
         "issuer": record["issuer"],
         "parent_digest": record["parent_digest"],
         "relation": relation,
         "revocation": revocation,
     }
+    # 仅在该节点是被裁决的分叉点时附带 resolution, 保持普通节点响应不变。
+    if resolution is not None:
+        out["resolution"] = resolution
+    return out
 
 
 def _revocation_entry(
     record: dict[str, Any], relation: str, rev: dict[str, Any]
 ) -> dict[str, Any]:
     return _entry(record, relation, rev)
+
+
+def _resolve_fork(
+    conn: sqlite3.Connection,
+    records: list[dict[str, Any]],
+    at: str | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """在分叉点查找适用裁决。
+
+    返回 (selected_record, resolution):
+    命中时为 (所选证明记录, 裁决字典); 无适用裁决时为 (None, None)。
+    仅接受该时点之前最新、且分支集合与当前可见集合完全一致的裁决,
+    任何晚到分支都会导致集合不一致而 miss -> 调用方继续报 FORK。
+    """
+    digest = records[0]["artifact_digest"]
+    resolution = fetch_applicable_resolution(
+        conn, digest, [r["id"] for r in records], at=at
+    )
+    if resolution is None:
+        return None, None
+    selected = next(
+        (r for r in records if r["id"] == resolution["selected_proof_id"]),
+        None,
+    )
+    # 所选 proof_id 理应属于该分支集合 (集合完全一致), miss 仅作防御。
+    if selected is None:
+        return None, None
+    return selected, resolution
 
 
 def _terminal_failure(
@@ -118,6 +163,7 @@ def _branch_summary(
     )
     rev = fetch_revocation(conn, record["artifact_digest"], at=at)
     return {
+        "proof_id": record["id"],
         "artifact_digest": record["artifact_digest"],
         "issuer": record["issuer"],
         "parent_digest": record["parent_digest"],
@@ -164,22 +210,30 @@ def _trace_terminus(
             failure["missing_artifact"] = current_parent
             return _TraceResult(MISSING_PARENT, failure, ancestors)
 
-        # 祖先节点出现分叉。
         if len(records) > 1:
-            rec = records[0]
-            ancestors.append(_entry(rec, "fork_point"))
-            return _TraceResult(
-                FORK,
-                {
-                    "code": FORK,
-                    "detail": f"祖先制品 {current_parent} 存在 {len(records)} 条分叉证明",
-                    "at": ancestors[-1],
-                    "branches": [_branch_summary(conn, r, at=at) for r in records],
-                },
-                ancestors,
-            )
+            # 祖先节点出现分叉: 尝试套用当时适用的裁决。
+            record, resolution = _resolve_fork(conn, records, at)
+            if record is None:
+                rec = records[0]
+                ancestors.append(_entry(rec, "fork_point"))
+                return _TraceResult(
+                    FORK,
+                    {
+                        "code": FORK,
+                        "detail": (
+                            f"祖先制品 {current_parent} 存在 {len(records)} 条分叉证明"
+                        ),
+                        "at": ancestors[-1],
+                        "branches": [
+                            _branch_summary(conn, r, at=at) for r in records
+                        ],
+                    },
+                    ancestors,
+                )
+        else:
+            record = records[0]
+            resolution = None
 
-        record = records[0]
         digest = record["artifact_digest"]
 
         # 成环优先判定, 避免在环内重复做签名/撤销检查。
@@ -239,7 +293,13 @@ def _trace_terminus(
             if cfg.trusted_root_issuers and (
                 record["issuer"] not in cfg.trusted_root_issuers
             ):
-                ancestors.append(_entry(record, "untrusted_root"))
+                ancestors.append(
+                    _entry(
+                        record,
+                        "untrusted_root",
+                        resolution=resolution,
+                    )
+                )
                 return _TraceResult(
                     UNTRUSTED_ROOT,
                     _terminal_failure(
@@ -250,10 +310,10 @@ def _trace_terminus(
                     ),
                     ancestors,
                 )
-            ancestors.append(_entry(record, "root"))
+            ancestors.append(_entry(record, "root", resolution=resolution))
             return _TraceResult(OK, {}, ancestors)
 
-        ancestors.append(_entry(record, "ancestor"))
+        ancestors.append(_entry(record, "ancestor", resolution=resolution))
         current_parent = record["parent_digest"]
 
 
@@ -292,6 +352,7 @@ def _evaluate(
                 NOT_FOUND, f"制品 {digest} 不存在任何证明记录", None
             ),
             "chain": [],
+            "applied_resolution": None,
         }
 
     # 目标制品自身被撤销 (无论有几条证明)。
@@ -309,23 +370,34 @@ def _evaluate(
                 rev,
             ),
             "chain": [],
+            "applied_resolution": None,
         }
 
-    # 目标制品处出现分叉。
+    # 目标制品处出现分叉: 先找当时适用的裁决。
+    target_resolution = None
     if len(records) > 1:
-        return {
-            "artifact_digest": digest,
-            "status": FORK,
-            "failure": {
-                "code": FORK,
-                "detail": f"制品 {digest} 存在 {len(records)} 条分叉证明, 信任链不唯一",
-                "at": _entry(records[0], "fork_point"),
-                "branches": [_branch_summary(conn, r, at=at) for r in records],
-            },
-            "chain": [],
-        }
-
-    record = records[0]
+        record, target_resolution = _resolve_fork(conn, records, at)
+        if record is None:
+            return {
+                "artifact_digest": digest,
+                "status": FORK,
+                "failure": {
+                    "code": FORK,
+                    "detail": (
+                        f"制品 {digest} 存在 {len(records)} 条分叉证明,"
+                        " 信任链不唯一"
+                    ),
+                    "at": _entry(records[0], "fork_point"),
+                    "branches": [
+                        _branch_summary(conn, r, at=at) for r in records
+                    ],
+                },
+                "chain": [],
+                # 未裁决或旧裁决已被晚到分支作废 -> 明确返回 null。
+                "applied_resolution": None,
+            }
+    else:
+        record = records[0]
 
     # 目标证明签名校验。
     sig_ok = crypto.verify(
@@ -344,9 +416,10 @@ def _evaluate(
                 record,
             ),
             "chain": [],
+            "applied_resolution": target_resolution,
         }
 
-    target_entry = _entry(record, "target")
+    target_entry = _entry(record, "target", resolution=target_resolution)
 
     # 根证明。
     if not record["parent_digest"]:
@@ -363,14 +436,16 @@ def _evaluate(
                     "untrusted_root",
                 ),
                 "chain": [],
+                "applied_resolution": target_resolution,
             }
-        root_entry = _entry(record, "root")
+        root_entry = _entry(record, "root", resolution=target_resolution)
         return {
             "artifact_digest": digest,
             "status": OK,
             "chain": [root_entry],
             "root_issuer": record["issuer"],
             "length": 1,
+            "applied_resolution": target_resolution,
         }
 
     trace = _trace_terminus(conn, record, cfg, at=at)
@@ -382,6 +457,8 @@ def _evaluate(
             # 失败路径: 目标 -> 已验证的祖先 -> 故障点
             "failure_path": [target_entry, *trace.ancestors],
             "chain": [],
+            # 顶层只反映目标处分叉的裁决; 祖先分叉点的裁决见各节点 resolution。
+            "applied_resolution": target_resolution,
         }
 
     chain = [target_entry, *trace.ancestors]
@@ -391,4 +468,5 @@ def _evaluate(
         "chain": chain,
         "root_issuer": trace.ancestors[-1]["issuer"],
         "length": len(chain),
+        "applied_resolution": target_resolution,
     }

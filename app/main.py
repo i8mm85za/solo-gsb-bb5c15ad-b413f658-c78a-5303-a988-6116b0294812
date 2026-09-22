@@ -16,6 +16,7 @@ from .database import (
     TrustRootConflict,
     TrustRootNotFound,
     activate_trust_root,
+    create_fork_resolution,
     create_trust_root,
     fetch_active_root,
     fetch_named_root_keys,
@@ -23,10 +24,16 @@ from .database import (
     fetch_revocation,
     get_connection,
     init_db,
+    list_fork_resolutions,
     list_trust_roots,
     row_to_dict,
+    ForkResolutionInvalidSelection,
+    ForkResolutionNoFork,
 )
 from .schemas import (
+    ForkResolutionIn,
+    ForkResolutionListResponse,
+    ForkResolutionResponse,
     GenericMessage,
     ProofIn,
     RevokeIn,
@@ -288,8 +295,65 @@ def get_revocation(
     return GenericMessage(status="REVOKED", detail=row["reason"], proof=row)
 
 
-# ---------- 信任根版本 ----------
+# ---------- 分叉裁决 ----------
 
+
+@app.post(
+    "/fork-resolutions",
+    response_model=ForkResolutionResponse,
+    tags=["fork-resolutions"],
+    summary="对分叉制品追加一条裁决 (选定一条证明, 原子记录当时全部分支)",
+    status_code=201,
+)
+def create_fork_resolution_endpoint(
+    payload: ForkResolutionIn,
+    conn: sqlite3.Connection = Depends(db),
+) -> dict[str, Any]:
+    # 选择合法性先于分叉判定不成立: 仅当目标确有分叉时, “选错”才是 400;
+    # 目标根本没有分叉时统一返回 409。
+    # 校验与写入在 database 层同一 BEGIN IMMEDIATE 事务内完成,
+    # branch_proof_ids 与“当时全部分支”是同一快照, 并发写入不会撕裂。
+    if payload.selected_proof_id <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"selected_proof_id 非法: {payload.selected_proof_id}",
+        )
+    try:
+        return create_fork_resolution(
+            conn,
+            payload.artifact_digest,
+            payload.selected_proof_id,
+            payload.reason,
+        )
+    except ForkResolutionNoFork as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ForkResolutionInvalidSelection as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get(
+    "/fork-resolutions/{artifact_digest}",
+    response_model=ForkResolutionListResponse,
+    tags=["fork-resolutions"],
+    summary="按时间 (写入顺序) 列出某制品的全部分叉裁决",
+)
+def list_fork_resolutions_endpoint(
+    artifact_digest: str,
+    conn: sqlite3.Connection = Depends(db),
+) -> dict[str, Any]:
+    rows = list_fork_resolutions(conn, artifact_digest)
+    if not rows:
+        raise HTTPException(
+            status_code=404, detail="未找到该制品的分叉裁决记录"
+        )
+    return {
+        "status": "OK",
+        "artifact_digest": artifact_digest,
+        "resolutions": rows,
+    }
+
+
+# ---------- 信任根版本 ----------
 
 @app.post(
     "/trust-roots",

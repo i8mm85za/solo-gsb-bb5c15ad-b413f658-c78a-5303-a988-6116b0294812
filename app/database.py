@@ -1,6 +1,7 @@
 """SQLite 持久层。"""
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from typing import Any, Iterable
@@ -14,6 +15,14 @@ class TrustRootConflict(Exception):
 
 class TrustRootNotFound(Exception):
     """指定的信任根版本不存在。"""
+
+
+class ForkResolutionNoFork(Exception):
+    """目标制品当前不存在分叉 (不足两条不同证明), 不能裁决。"""
+
+
+class ForkResolutionInvalidSelection(Exception):
+    """所选 proof_id 不属于目标制品。"""
 
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -68,6 +77,21 @@ CREATE TABLE IF NOT EXISTS trust_root_state (
     version_id INTEGER NOT NULL REFERENCES trust_root_versions(id),
     activated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- 分叉裁决: 只追加 (append-only), 不更新/不删除。每条裁决在写入事务内
+-- 原子记录当时全部可见分支 proof_id (branch_proof_ids, JSON 数组),
+-- 之后任何晚到分支都会使分支集合不一致, 该裁决立即失效。
+CREATE TABLE IF NOT EXISTS fork_resolutions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    artifact_digest  TEXT NOT NULL,
+    selected_proof_id INTEGER NOT NULL,
+    reason           TEXT NOT NULL,
+    branch_proof_ids TEXT NOT NULL,
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS ix_fork_resolutions_artifact
+    ON fork_resolutions (artifact_digest, id);
 """
 
 
@@ -315,3 +339,114 @@ def fetch_named_root_keys(
         (row["id"],),
     ).fetchall()
     return frozenset(r["public_key"] for r in rows)
+
+
+# ---------- 分叉裁决 ----------
+
+
+def resolution_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """把 fork_resolutions 行转为响应字典 (branch_proof_ids 解析为列表)。"""
+    out = row_to_dict(row)
+    out["branch_proof_ids"] = json.loads(out["branch_proof_ids"])
+    return out
+
+
+def create_fork_resolution(
+    conn: sqlite3.Connection,
+    artifact_digest: str,
+    selected_proof_id: int,
+    reason: str,
+) -> dict[str, Any]:
+    """在同一事务内校验分叉并追加裁决记录。
+
+    - 目标当前不足两条不同证明 -> ForkResolutionNoFork (对应 HTTP 409);
+    - selected_proof_id 不属于目标 -> ForkResolutionInvalidSelection (400)。
+    裁决行的 branch_proof_ids 与校验读自同一事务, 保证“当时全部分支”的
+    原子快照: 与并发写入互不撕裂, 晚到分支会使集合不一致从而使裁决失效。
+    """
+    # IMMEDIATE 立即获取写锁, 使“读取当前全部分支 -> 插入裁决”原子串行化,
+    # 并发裁决/并发写入之间不会互相漏看分支。
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        proofs = conn.execute(
+            "SELECT id FROM proofs WHERE artifact_digest = ? ORDER BY id",
+            (artifact_digest,),
+        ).fetchall()
+        proof_ids = [r["id"] for r in proofs]
+
+        if len(proof_ids) < 2:
+            raise ForkResolutionNoFork(
+                f"制品 {artifact_digest} 当前不存在分叉"
+                " (少于两条不同证明), 无需裁决"
+            )
+        if selected_proof_id not in proof_ids:
+            raise ForkResolutionInvalidSelection(
+                f"所选 proof_id={selected_proof_id} 不属于制品"
+                f" {artifact_digest} 的任何证明记录"
+            )
+
+        cur = conn.execute(
+            "INSERT INTO fork_resolutions"
+            " (artifact_digest, selected_proof_id, reason, branch_proof_ids)"
+            " VALUES (?, ?, ?, ?)",
+            (
+                artifact_digest,
+                selected_proof_id,
+                reason,
+                json.dumps(proof_ids, separators=(",", ":")),
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    row = conn.execute(
+        "SELECT * FROM fork_resolutions WHERE id = ?",
+        (cur.lastrowid,),
+    ).fetchone()
+    return resolution_to_dict(row)
+
+
+def list_fork_resolutions(
+    conn: sqlite3.Connection,
+    artifact_digest: str,
+) -> list[dict[str, Any]]:
+    """按时间 (写入顺序) 列出某制品的全部分叉裁决 (含已失效裁决)。"""
+    rows = conn.execute(
+        "SELECT * FROM fork_resolutions WHERE artifact_digest = ? ORDER BY id",
+        (artifact_digest,),
+    ).fetchall()
+    return [resolution_to_dict(r) for r in rows]
+
+
+def fetch_applicable_resolution(
+    conn: sqlite3.Connection,
+    artifact_digest: str,
+    visible_proof_ids: list[int],
+    at: str | None = None,
+) -> dict[str, Any] | None:
+    """查找适用于当前可见分支集合的最新裁决。
+
+    适用条件 (两者同时满足):
+    - 裁决在求值时点之前/之时作出 (created_at <= at; at 为 None 时不限);
+    - 裁决记录的分支集合与当时可见分支集合**完全一致**。
+    取最新一条; 任何晚到分支 (或晚消失的分支) 都会使集合不一致,
+    旧裁决因此失效, 返回 None -> 校验重新报 FORK。
+    """
+    visible = sorted(visible_proof_ids)
+    if at is None:
+        rows = conn.execute(
+            "SELECT * FROM fork_resolutions WHERE artifact_digest = ? ORDER BY id DESC",
+            (artifact_digest,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM fork_resolutions"
+            " WHERE artifact_digest = ? AND created_at <= ? ORDER BY id DESC",
+            (artifact_digest, at),
+        ).fetchall()
+    for row in rows:
+        if sorted(json.loads(row["branch_proof_ids"])) == visible:
+            return resolution_to_dict(row)
+    return None

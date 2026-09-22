@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""端到端演示: 生成密钥 -> 写入根/子证明 -> 校验 -> 制造分叉/撤销 -> 观察失败路径。
+"""端到端演示: 生成密钥 -> 写入根/子证明 -> 校验 -> 制造分叉/撤销 -> 观察失败路径
+-> 对分叉追加裁决 -> 观察校验沿所选分支恢复。
 
 仅依赖标准库 + cryptography (容器内已安装)。
 用法:
@@ -102,6 +103,29 @@ def main() -> None:
 
     status, body = _request("GET", f"/verify/{l2}")
     show("失败: 祖先分叉 FORK, branches 列出全部候选", status, body)
+
+    # 4) 分叉裁决: 选定其中一条 m2 证明后, 校验可沿该分支继续
+    status, proofs = _request("GET", f"/proofs/artifact/{m2}")
+    assert status == 200, proofs
+    # 选择 root_priv 签发的那条 (演示中视为权威分支)
+    selected = next(p["id"] for p in proofs["proofs"] if p["issuer"] == root_pub)
+    status, body = _request(
+        "POST",
+        "/fork-resolutions",
+        {
+            "artifact_digest": m2,
+            "selected_proof_id": selected,
+            "reason": "演示: 审查后采用 root 密钥签发的分支",
+        },
+    )
+    show("追加分叉裁决 (原子记录当时全部分支 proof_id)", status, body)
+
+    status, body = _request("GET", f"/verify/{l2}")
+    show("裁决后: 沿所选分支继续验链, 附带 applied_resolution", status, body)
+
+    # 5) 列出该制品的全部裁决 (按时间, 含未来可能失效的裁决)
+    status, body = _request("GET", f"/fork-resolutions/{m2}")
+    show("裁决历史列表", status, body)
 
     print("\n演示完成。")
 

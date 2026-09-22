@@ -7,7 +7,8 @@ services:
       - "8080:8080"
     environment:
       # SQLite 数据库文件位置 (容器内), 持久化到命名卷。
-      # 信任根版本 (POST /trust-roots) 也写入该数据库, 随卷持久化,
+      # 信任根版本 (POST /trust-roots) 与分叉裁决
+      # (POST /fork-resolutions) 也写入该数据库, 随卷持久化,
       # 升级镜像后表结构自动迁移 (CREATE TABLE IF NOT EXISTS)。
       DATABASE_PATH: /data/proofs.db
       MAX_CHAIN_DEPTH: "256"
